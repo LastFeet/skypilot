@@ -13,6 +13,7 @@ from sky.utils import status_lib
 from sky.utils import ux_utils
 
 POLL_INTERVAL = 10
+_READY_TIMEOUT = 20 * 60  # LastFeet patch: seconds for a new box to come up
 
 logger = sky_logging.init_logger(__name__)
 # a much more convenient method
@@ -150,7 +151,20 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 head_instance_id = instance_id
 
     # Wait for instances to be ready.
+    # LastFeet patch: give up (SkyPilot then tears the cluster down and tries
+    # another offer) when a box is gone, was outbid (an interruptible box is
+    # set to 'stopped', often while still loading), or is not up within
+    # _READY_TIMEOUT; stock 0.14.2 waited here forever (2026-10-29).
+    deadline = time.time() + _READY_TIMEOUT
     while True:
+        everything = _filter_instances(cluster_name_on_cloud, None)
+        bad = [(i, v.get('status'), v.get('intended_status'))
+               for i, v in everything.items()
+               if v.get('intended_status') == 'stopped']
+        if not everything or bad or time.time() > deadline:
+            raise RuntimeError(
+                f'Vast instances for {cluster_name_on_cloud} not ready: '
+                f'{"gone" if not everything else bad or "timed out"}')
         instances = _filter_instances(cluster_name_on_cloud, ['RUNNING'])
         ready_instance_cnt = 0
         for instance_id, instance in instances.items():

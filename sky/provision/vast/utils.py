@@ -128,11 +128,18 @@ def launch(name: str,
     #   countries        ['US', 'CA'] or 'any' instead of the catalog region
     #                    (checked on each offer: an 'in [...]' term with
     #                    chunked=true makes vastai-sdk 1.9 drop the query)
+    #   blocked_countries  ['CN', 'VN', ...]: never an offer there, nor one
+    #                    with no stated location (read at each launch: the
+    #                    default is ~/.sky/config.yaml's, a task or --config
+    #                    can set its own)
     #   whole_machine    only offers with all the host's CPU threads
     #   cpu_rank         regexes on cpu_name, best first (stable within a rank)
     #   cpu_rank_strict  drop offers matching none of cpu_rank
     #   cpu_rank_max     drop offers ranked below this index of cpu_rank
     #   max_offer_tries  offers to try when one is taken between search+create
+    #   bid_mult         spot (use_spot): bid this times the offer's min_bid
+    #                    (default 1.25: at 1.0, 2026-10-29 boxes were outbid
+    #                    while still loading)
     # With offer_min.cpu_ram (MB) the query drops its own cpu_ram term: that one
     # is the catalog type's 64 GB, which 64 GB hosts reporting 62.x GB fail.
     kwargs = dict(create_instance_kwargs or {})
@@ -144,11 +151,13 @@ def launch(name: str,
     offer_min = dict(kwargs.pop('offer_min', None) or {})
     offer_max = dict(kwargs.pop('offer_max', None) or {})
     countries = kwargs.pop('countries', None)
+    blocked = {c.strip().upper() for c in (kwargs.pop('blocked_countries', None) or [])}
     whole_machine = bool(kwargs.pop('whole_machine', False))
     cpu_rank = list(kwargs.pop('cpu_rank', None) or [])
     cpu_rank_strict = bool(kwargs.pop('cpu_rank_strict', False))
     cpu_rank_max = kwargs.pop('cpu_rank_max', None)
     max_offer_tries = max(1, int(kwargs.pop('max_offer_tries', 1)))
+    bid_mult = float(kwargs.pop('bid_mult', 1.25))
     create_instance_kwargs = kwargs
 
     if countries:  # 'any' or a list, checked on each offer below
@@ -159,7 +168,9 @@ def launch(name: str,
     # values (gpu_name="RTX 4090", cpu_ram>="64.0") when chunked=true is in
     # the query, and Vast then returns every GPU type.
     query = [
-        'chunked=true',
+        # No chunked=true for spot (Vast reads min_bid 0 with it) or whole_machine
+        # (it lists only slices of big servers; 2026-10-30). type=bid: interruptible.
+        *([] if preemptible or whole_machine else ['chunked=true']),
         *where,
         f'disk_space>={disk_size}',
         f'num_gpus={num_gpus}',
@@ -175,6 +186,7 @@ def launch(name: str,
     query_str = ' '.join(query)
 
     instance_list = vast.vast().search_offers(query=query_str,
+                                              type='bid' if preemptible else 'on-demand',
                                               order=search_order,
                                               limit=search_limit,
                                               storage=disk_size)
@@ -184,6 +196,12 @@ def launch(name: str,
         instance_list = [
             o for o in instance_list
             if (o.get('geolocation') or '').strip()[-2:] in countries
+        ]
+    if blocked:  # boxes get our keys and data: never in these countries
+        instance_list = [
+            o for o in instance_list
+            if len((o.get('geolocation') or '').strip()) >= 2 and
+            (o.get('geolocation') or '').strip()[-2:].upper() not in blocked
         ]
     instance_list = [
         o for o in instance_list
@@ -208,6 +226,9 @@ def launch(name: str,
             worst = min(worst, int(cpu_rank_max))
         instance_list = [o for o in instance_list if _rank(o) <= worst]
         instance_list.sort(key=_rank)
+
+    if preemptible:  # a spot box needs a bid; an offer without min_bid is on-demand only
+        instance_list = [o for o in instance_list if o.get('min_bid')]
 
     if len(instance_list) == 0:
         raise RuntimeError('Failed to create instances, could not find an '
@@ -316,7 +337,7 @@ def launch(name: str,
     for i, offer in enumerate(candidates):
         launch_params['id'] = offer['id']
         if bid_per_offer:
-            launch_params['price'] = offer.get('min_bid')
+            launch_params['price'] = round(offer['min_bid'] * bid_mult, 4)
         try:
             new_instance_contract = vast.vast().create_instance(**launch_params)
             break

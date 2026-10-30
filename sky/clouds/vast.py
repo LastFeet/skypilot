@@ -231,6 +231,9 @@ class Vast(clouds.Cloud):
             'image_id': image_id,
             'secure_only': secure_only,
             'create_instance_kwargs': create_instance_kwargs or {},
+            # LastFeet patch: the template's Preemptible: {{use_spot}} was never
+            # filled, so use_spot rented on-demand boxes (2026-10-29).
+            'use_spot': resources.use_spot,
         }
 
     def _get_feasible_launchable_resources(
