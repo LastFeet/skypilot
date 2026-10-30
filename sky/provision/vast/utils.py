@@ -6,6 +6,7 @@
 #
 """Vast library wrapper for SkyPilot."""
 from pathlib import Path
+import re
 import shlex
 from typing import Any, Dict, List, Optional
 
@@ -115,23 +116,100 @@ def launch(name: str,
     gpu_name = instance_type.split('-')[1].replace('_', ' ')
     num_gpus = int(instance_type.split('-')[0].replace('x', ''))
 
+    # LastFeet patch (lastfeet-monorepo tools/skypilot): offer-selection keys
+    # in vast.create_instance_kwargs, popped here so Vast never sees them.
+    #   search_query     extra Vast search terms, e.g. 'cpu_ghz>=4.5 inet_down>=500'
+    #   search_query_extra  more terms (for --config on top of a task's own)
+    #   search_order     Vast sort order, e.g. 'dph_total' (cheapest first)
+    #   search_limit     offers to fetch (default 256)
+    #   offer_min/max    {field: value} checked here on each offer, e.g.
+    #                    {cpu_ghz: 4.5}: Vast's own filter on some fields
+    #                    (cpu_ghz, 2026-10) lets other offers through
+    #   countries        ['US', 'CA'] or 'any' instead of the catalog region
+    #                    (checked on each offer: an 'in [...]' term with
+    #                    chunked=true makes vastai-sdk 1.9 drop the query)
+    #   whole_machine    only offers with all the host's CPU threads
+    #   cpu_rank         regexes on cpu_name, best first (stable within a rank)
+    #   cpu_rank_strict  drop offers matching none of cpu_rank
+    #   cpu_rank_max     drop offers ranked below this index of cpu_rank
+    #   max_offer_tries  offers to try when one is taken between search+create
+    # With offer_min.cpu_ram (MB) the query drops its own cpu_ram term: that one
+    # is the catalog type's 64 GB, which 64 GB hosts reporting 62.x GB fail.
+    kwargs = dict(create_instance_kwargs or {})
+    extra_query = ' '.join(
+        q for q in (kwargs.pop('search_query', None),
+                    kwargs.pop('search_query_extra', None)) if q)
+    search_order = kwargs.pop('search_order', None) or 'score-'
+    search_limit = int(kwargs.pop('search_limit', 256))
+    offer_min = dict(kwargs.pop('offer_min', None) or {})
+    offer_max = dict(kwargs.pop('offer_max', None) or {})
+    countries = kwargs.pop('countries', None)
+    whole_machine = bool(kwargs.pop('whole_machine', False))
+    cpu_rank = list(kwargs.pop('cpu_rank', None) or [])
+    cpu_rank_strict = bool(kwargs.pop('cpu_rank_strict', False))
+    cpu_rank_max = kwargs.pop('cpu_rank_max', None)
+    max_offer_tries = max(1, int(kwargs.pop('max_offer_tries', 1)))
+    create_instance_kwargs = kwargs
+
+    if countries:  # 'any' or a list, checked on each offer below
+        where = []
+    else:
+        where = ['georegion=true', f'geolocation={region[-2:]}']
+    # Unquoted terms: vastai-sdk 1.9's preprocess_search_query drops quoted
+    # values (gpu_name="RTX 4090", cpu_ram>="64.0") when chunked=true is in
+    # the query, and Vast then returns every GPU type.
     query = [
         'chunked=true',
-        'georegion=true',
-        f'geolocation="{region[-2:]}"',
+        *where,
         f'disk_space>={disk_size}',
         f'num_gpus={num_gpus}',
-        f'gpu_name="{gpu_name}"',
-        f'cpu_ram>="{cpu_ram}"',
+        f'gpu_name={gpu_name.replace(" ", "_")}',
     ]
+    if 'cpu_ram' not in offer_min:
+        query.append(f'cpu_ram>={cpu_ram}')
     if secure_only:
         query.append('datacenter=true')
         query.append('hosting_type>=1')
+    if extra_query:
+        query.append(extra_query)
     query_str = ' '.join(query)
 
-    instance_list = vast.vast().search_offers(query=query_str)
+    instance_list = vast.vast().search_offers(query=query_str,
+                                              order=search_order,
+                                              limit=search_limit,
+                                              storage=disk_size)
+    if isinstance(instance_list, int):
+        instance_list = []
+    if countries and countries != 'any':
+        instance_list = [
+            o for o in instance_list
+            if (o.get('geolocation') or '').strip()[-2:] in countries
+        ]
+    instance_list = [
+        o for o in instance_list
+        if all((o.get(k) or 0) >= float(v) for k, v in offer_min.items()) and
+        all((o.get(k) or 0) <= float(v) for k, v in offer_max.items())
+    ]
+    if whole_machine:
+        instance_list = [
+            o for o in instance_list if (o.get('cpu_cores_effective') or 0) >=
+            0.95 * (o.get('cpu_cores') or 1)
+        ]
+    if cpu_rank:
 
-    if isinstance(instance_list, int) or len(instance_list) == 0:
+        def _rank(offer: Dict[str, Any]) -> int:
+            for i, pattern in enumerate(cpu_rank):
+                if re.search(pattern, offer.get('cpu_name') or ''):
+                    return i
+            return len(cpu_rank)
+
+        worst = len(cpu_rank) - 1 if cpu_rank_strict else len(cpu_rank)
+        if cpu_rank_max is not None:
+            worst = min(worst, int(cpu_rank_max))
+        instance_list = [o for o in instance_list if _rank(o) <= worst]
+        instance_list.sort(key=_rank)
+
+    if len(instance_list) == 0:
         raise RuntimeError('Failed to create instances, could not find an '
                            'offer that satisfies the requirements '
                            f'"{query_str}".')
@@ -179,8 +257,7 @@ def launch(name: str,
     # Vast.ai SDK uses 'price' since SDK v6+; normalize bid_price for compat
     if 'bid_price' in launch_params:
         launch_params['price'] = launch_params.pop('bid_price')
-    if 'price' not in launch_params and preemptible:
-        launch_params['price'] = instance_touse.get('min_bid')
+    bid_per_offer = 'price' not in launch_params and preemptible
 
     # Handle onstart_cmd - read from file if onstart path provided
     user_onstart_cmd = launch_params.pop('onstart_cmd', None)
@@ -231,12 +308,29 @@ def launch(name: str,
             env_dict.update(user_env)
         elif isinstance(user_env, str):
             # Parse legacy "-e KEY=VAL" style strings for backwards compat
-            import re  # pylint: disable=import-outside-toplevel
             for match in re.finditer(r'-e\s+(\w+)=([^\s]*)', user_env):
                 env_dict[match.group(1)] = match.group(2)
     launch_params['env'] = env_dict
 
-    new_instance_contract = vast.vast().create_instance(**launch_params)
+    candidates = instance_list[:max_offer_tries]
+    for i, offer in enumerate(candidates):
+        launch_params['id'] = offer['id']
+        if bid_per_offer:
+            launch_params['price'] = offer.get('min_bid')
+        try:
+            new_instance_contract = vast.vast().create_instance(**launch_params)
+            break
+        except Exception as e:  # pylint: disable=broad-except
+            # Vast's JSON error (e.g. insufficient_credit, no_such_ask) is in
+            # the response body; the HTTPError text alone says only '400'.
+            body = getattr(getattr(e, 'response', None), 'text', '') or ''
+            taken = re.search(r'no_such_ask|not available|unavailable', body)
+            if not taken or i == len(candidates) - 1:
+                raise RuntimeError(f'Vast create_instance for offer '
+                                   f'{offer["id"]} failed: {e} {body[:300]}'
+                                  ) from e
+            logger.info(f'Vast offer {offer["id"]} was taken ({body[:120]}); '
+                        'trying the next one.')
 
     new_instance = vast.vast().show_instance(
         id=new_instance_contract['new_contract'])
