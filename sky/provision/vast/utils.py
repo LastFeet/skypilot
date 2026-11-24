@@ -10,6 +10,7 @@ import re
 import shlex
 from typing import Any, Dict, List, Optional
 
+from sky.provision.vast import blocklist
 from sky import sky_logging
 from sky.adaptors import vast
 
@@ -137,6 +138,10 @@ def launch(name: str,
     #   cpu_rank_strict  drop offers matching none of cpu_rank
     #   cpu_rank_max     drop offers ranked below this index of cpu_rank
     #   max_offer_tries  offers to try when one is taken between search+create
+    #   ignore_machine_blocklist  true: also rent machines blocklist.py has
+    #                    blocked for not coming up
+    #   load_timeout_min minutes a new box may take to reach 'running' before
+    #                    it is given up and its machine blocked (default 8)
     #   bid_mult         spot (use_spot): bid this times the offer's min_bid
     #                    (default 1.25: at 1.0, 2026-10-29 boxes were outbid
     #                    while still loading)
@@ -157,6 +162,9 @@ def launch(name: str,
     cpu_rank_strict = bool(kwargs.pop('cpu_rank_strict', False))
     cpu_rank_max = kwargs.pop('cpu_rank_max', None)
     max_offer_tries = max(1, int(kwargs.pop('max_offer_tries', 1)))
+    ignore_machine_blocklist = bool(
+        kwargs.pop('ignore_machine_blocklist', False))
+    kwargs.pop('load_timeout_min', None)  # read by instance.run_instances
     bid_mult = float(kwargs.pop('bid_mult', 1.25))
     create_instance_kwargs = kwargs
 
@@ -208,6 +216,13 @@ def launch(name: str,
         if all((o.get(k) or 0) >= float(v) for k, v in offer_min.items()) and
         all((o.get(k) or 0) <= float(v) for k, v in offer_max.items())
     ]
+    if not ignore_machine_blocklist:  # machines that did not come up lately
+        bad_machines = blocklist.blocked()
+        bad_hosts = blocklist.blocked_hosts()
+        instance_list = [
+            o for o in instance_list
+            if blocklist.allowed(o, bad_machines, bad_hosts)
+        ]
     if whole_machine:
         instance_list = [
             o for o in instance_list if (o.get('cpu_cores_effective') or 0) >=

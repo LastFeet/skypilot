@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sky import sky_logging
 from sky.provision import common
 from sky.provision import docker_utils
+from sky.provision.vast import blocklist
 from sky.provision.vast import utils
 from sky.utils import common_utils
 from sky.utils import resources_utils
@@ -14,6 +15,11 @@ from sky.utils import ux_utils
 
 POLL_INTERVAL = 10
 _READY_TIMEOUT = 20 * 60  # LastFeet patch: seconds for a new box to come up
+# LastFeet patch: minutes a new box may sit in 'loading' (not yet running)
+# before it is given up and its machine goes on the blocklist. Vast's own
+# images are usually cached and running within 1-3 min; a machine that is
+# still loading after this has, so far, never come up (2026-11-24).
+_LOAD_TIMEOUT_MIN = 8.0
 
 logger = sky_logging.init_logger(__name__)
 # a much more convenient method
@@ -156,8 +162,33 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     # set to 'stopped', often while still loading), or is not up within
     # _READY_TIMEOUT; stock 0.14.2 waited here forever (2026-10-29).
     deadline = time.time() + _READY_TIMEOUT
+    load_min = float((create_instance_kwargs or {}).get('load_timeout_min') or
+                     _LOAD_TIMEOUT_MIN)
+    load_deadline = time.time() + 60 * load_min
+    created = {str(i) for i in created_instance_ids}
     while True:
         everything = _filter_instances(cluster_name_on_cloud, None)
+        if created and time.time() > load_deadline:
+            # A box this launch created that is still not running: block its
+            # machine for a while (blocklist.py), so the next search skips it.
+            stuck = [(i, v) for i, v in everything.items()
+                     if str(i) in created and v.get('status') != 'RUNNING']
+            for instance_id, v in stuck:
+                why = (f'still {v.get("actual_status")} after {load_min:.0f} min: '
+                       f'{(v.get("status_msg") or "").strip()[:160]}')
+                entry = blocklist.strike(v.get('machine_id'),
+                                         why,
+                                         host_id=v.get('host_id'),
+                                         geolocation=v.get('geolocation'),
+                                         gpu=f'{v.get("num_gpus")}x {v.get("gpu_name")}')
+                logger.warning(
+                    f'Vast machine {v.get("machine_id")} (instance {instance_id}) {why}. '
+                    f'Blocked until {entry.get("until_date")}.')
+            if stuck:
+                raise RuntimeError(
+                    f'Vast instances for {cluster_name_on_cloud} not ready: '
+                    f'still loading after the load timeout; machine(s) '
+                    f'{[v.get("machine_id") for _, v in stuck]} blocked')
         bad = [(i, v.get('status'), v.get('intended_status'))
                for i, v in everything.items()
                if v.get('intended_status') == 'stopped']
@@ -173,6 +204,10 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
         logger.info('Waiting for instances to be ready: '
                     f'({ready_instance_cnt}/{config.count}).')
         if ready_instance_cnt == config.count:
+            for instance in instances.values():  # came up: off the blocklist
+                if blocklist.cleared(instance.get('machine_id')):
+                    logger.info(f'Vast machine {instance.get("machine_id")} '
+                                'came up: removed from the blocklist.')
             break
 
         time.sleep(POLL_INTERVAL)
